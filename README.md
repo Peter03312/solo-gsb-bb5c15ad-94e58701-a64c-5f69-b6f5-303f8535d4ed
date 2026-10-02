@@ -1,6 +1,13 @@
 # 双人见证资料封存服务
 
-本地账号、密钥操作的资料封存/开封服务。封存后正文不可修改、不可（在开封前）被读取；
+本地账号、密钥操作的资料封存/开封服务。封存人既可以直接封存，也可以先发起
+**需三名见证人确认的预封存**：提交正文、三名互异且非本人的已注册见证人及
+带时区的未来确认截止时刻，取得提案编号和正文摘要（响应不含正文）；仅发起人
+及受邀见证人可查看提案摘要、截止时刻、状态与确认人数，其他账号不可凭编号
+探知提案。见证人凭摘要各确认一次（摘要不符、重复确认拒绝且不计票），三人
+在截止前确认后，事务内按现有封存规则生成一份正式封存资料并返回资料编号，
+重复请求不得再生成资料；发起人可在完成前撤回，截止时未集齐即失效，撤回/
+失效/完成后清空提案正文。封存后正文不可修改、不可（在开封前）被读取；
 开封必须由封存人发起请求（理由 + 截止时刻，可选**最早开封时刻**），并在截止前取得
 **两名不同指定见证人**分别同意；同意必须绑定本次请求与封存时的摘要。
 资料未开封时，封存人可在见证人无法履职后**替换指定见证人**，新见证人可继续为
@@ -30,7 +37,13 @@
 | 本地账号，凭密钥操作 | `POST /register` 返回一次性 API Key，请求头 `X-API-Key` 携带；服务端只存 SHA-256 哈希 |
 | 密钥轮换 | `POST /me/api-key/rotate` 凭**当前**密钥换取新密钥：新明文为 256 位随机串、**仅本次响应返回一次**，库内只保存其 SHA-256 摘要（旧摘要被覆盖，不保留历史密钥），旧密钥自轮换提交后立即失效并随 WAL 持久化（重启后仍失效）；轮换本身追加一条 `api_key_rotated` 审计（不含密钥材料） |
 | 轮换与业务写并发 | 所有已认证写操作在 `BEGIN IMMEDIATE` 锁内先复核密钥是否仍是当前摘要：**轮换先提交**则持旧密钥并发的封存/同意/撤销/替换/交接/清除安排/签发凭证/撤销凭证/标记已读/签发快照一律 `401` 并整体回滚——业务写入不生效、不留下业务审计，也不触发连带结算；**业务写先提交**则照常完成，轮换随后提交。无效或已失效密钥沿用既有 `401`，不区分账号是否存在；未轮换账号与无需登录的兑换/验真行为不变 |
-| 封存需三名不同见证人 | 封存时校验三人互异、均已注册、且不含封存人本人 |
+| 封存需三名不同见证人 | `POST /documents` 封存时校验三人互异、均已注册、且不含封存人本人 |
+| 预封存提案 | `POST /pre-seal-proposals`：提交正文、三名互异且非本人的已注册见证人、带时区未来确认截止时刻，返回提案编号与 SHA-256 摘要（**响应不含正文**）；正文在集齐确认前仅暂存于提案行，撤回/失效/完成后立即清空 |
+| 预封存可见性 | 仅提案发起人及三名受邀见证人可查看提案摘要、截止时刻、状态与确认人数（`GET /pre-seal-proposals/{id}`）；其他账号（含其他资料参与方）凭编号一律 `403`，不区分提案是否存在；完成前提案不出现在资料列表 |
+| 凭摘要各确认一次 | `POST /pre-seal-proposals/{id}/confirmations`：仅受邀见证人可确认，须提交与提案一致的摘要；摘要不符 `409` 拒绝且不计票，`UNIQUE(proposal_id, witness_id)` 保证同一人重复确认只计一次（重复 `409`），非受邀/发起人/不可见编号统一 `403` |
+| 集齐即事务内封存 | 三人在截止前全部确认后，在**同一写事务**内沿用直接封存的现有规则生成正式封存资料（同摘要、同发起人、同三名见证人，追加既有 `seal` 审计）并返回 `document_id`；失败不产生资料或封存审计；`document_id` 部分唯一索引 + 状态条件更新兜底，重复请求不得再生成资料 |
+| 预封存撤回/到期 | 发起人可在完成前 `POST /pre-seal-proposals/{id}/revoke`（仅发起人，他人统一 403）；截止时未集齐三人即 `expired`（后台扫描器、GET、确认/撤回临界区都会确定性判定）；撤回、失效或完成后**清空提案正文**（保留摘要、确认记录与审计元数据） |
+| 预封存并发顺序 | 确认、撤回、到期与密钥轮换共用同一把 `BEGIN IMMEDIATE` 写锁按已提交顺序确定唯一结果：第三票确认 vs 撤回要么封存要么撤回互斥唯一；轮换先提交则持旧密钥的确认/撤回升 `401` 并整体回滚（不计票、不生成资料、不留封存审计），持新密钥可补票 |
 | 保存正文及摘要 | 正文原文与 SHA-256 摘要同表保存；封存后无任何更新接口，内容不可改 |
 | 开封前不泄露正文 | 封存/待开封状态下查询/列表/错误响应均不含 `body`；非参与方一律 `403`，不区分资料是否存在 |
 | 开封请求 | 封存人提交 `reason` 与带时区的 `deadline`（必须晚于当前时间） |
@@ -157,7 +170,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/register` | 注册，返回一次性 `api_key` |
 | GET | `/me` | 查询当前密钥对应的账号 |
 | POST | `/me/api-key/rotate` | 凭当前 `X-API-Key` 轮换密钥：新明文 `api_key` 仅本次响应返回一次，旧密钥即刻失效 |
-| POST | `/documents` | 封存资料：`{body, witnesses:[3人]}`，返回 `digest`（无正文） |
+| POST | `/documents` | 直接封存资料：`{body, witnesses:[3人]}`，返回 `digest`（无正文） |
+| POST | `/pre-seal-proposals` | 发起预封存：`{body, witnesses:[3人], confirm_deadline}`，返回提案编号与摘要（无正文） |
+| GET | `/pre-seal-proposals/{id}` | 查询提案：仅发起人及受邀见证人可见；返回摘要、截止时刻、状态、确认人数（无正文） |
+| POST | `/pre-seal-proposals/{id}/confirmations` | 受邀见证人凭 `{digest}` 确认；第三票在同事务生成正式封存资料并返回 `document_id` |
+| POST | `/pre-seal-proposals/{id}/revoke` | 发起人在完成前撤回提案（撤回后清空提案正文） |
 | GET | `/documents` | 列出本人封存/见证的资料（仅元数据，含 `purge_at`/`purged_at`） |
 | GET | `/documents/{id}` | 详情；开封后才含 `body`、`reason`、`witness_approvals`；已清除返回 `purged` 与清除时刻 |
 | POST | `/documents/{id}/open-requests` | 封存人提交开封请求：`{reason, deadline, earliest_open_at?}` |
@@ -189,7 +206,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 冲突（重复同意、重复开封、请求已撤销/到期、waiting 下再同意、已有进行中请求、
 新见证人已在名单、资料已开封仍替换、重复发起待确认交接邀请、确认已撤回/逾期/
 已确认的邀请、交接时资料已开封、资料已清除仍开封/替换/交接/安排清除/签发阅览凭证、
-清除时刻已到仍改期/取消、无清除安排仍取消、撤销已兑付/已撤销/已过期凭证等）`409`。
+清除时刻已到仍改期/取消、无清除安排仍取消、撤销已兑付/已撤销/已过期凭证、
+预封存摘要不符/重复确认、确认/撤回已撤回/已失效/已完成的预封存提案、
+预封存已过截止时刻仍确认/撤回、完成后撤回提案等）`409`。
+预封存接口：见证人不互异/含本人/未注册、确认截止时刻已过为 `400`；截止时刻
+不带时区、见证人人数不是三人为 `422`；非参与方凭编号查询/非受邀见证人确认/
+非发起人撤回升 `403`（不区分提案是否存在）；缺少/错误凭据 `401`（含轮换后
+的旧密钥：持旧密钥的确认/撤回与其他已认证写一致地 `401` 回滚）。
 凭证兑换的全部失败（无效明文、过期、撤销、已兑付、资料已清除）统一
 **`404` 同一文案**，不区分原因、不泄露正文或资料存在性。
 通知接口：游标或页大小非法为 `422`；标记他人或不存在的通知编号统一 `403`
@@ -233,6 +256,94 @@ curl -sS -X POST $BASE/open-requests/1/approve -H "X-API-Key: $W2_KEY" \
 curl -sS $BASE/documents/1 -H "X-API-Key: $OWNER_KEY"
 # 到达最早开封时刻后（扫描间隔内）再查 -> status=opened，可见 body
 ```
+
+### 预封存：三名见证人确认后再封存（pre-seal proposal）
+
+封存人想先取得见证人确认、再让正文正式落为封存资料时，可发起**预封存提案**：
+
+- `POST /pre-seal-proposals`（需 `X-API-Key`），请求体
+  `{"body": "<正文>", "witnesses": ["<见证人1>", "<见证人2>", "<见证人3>"],
+  "confirm_deadline": "<带时区 ISO-8601 时刻>"}`。
+  - 三名见证人必须**互异、均已注册、且不含封存人本人**（与直接封存同一套校验）；
+  - `confirm_deadline` 必须带时区且**晚于当前时间**。
+  - 成功 `201` 返回提案编号 `proposal_id`、正文 SHA-256 `digest`、截止时刻、
+    状态 `pending`、确认人数 `confirmation_count`（初始 0）与见证人名单——
+    **响应不含正文**。
+- `GET /pre-seal-proposals/{id}`：返回提案的摘要、截止时刻、状态、确认人数、
+  见证人名单与（完成后的）`document_id`。**仅发起人及三名受邀见证人可见**；
+  其他账号（含其他资料参与方）凭编号统一 `403`
+  `{"detail":"无权访问该提案或提案不存在"}`，无法探知提案是否存在。查询前先
+  确定性判定到期：已过截止时刻未集齐的提案呈现 `expired`。响应始终不含正文。
+- `POST /pre-seal-proposals/{id}/confirmations`（需受邀见证人本人密钥），
+  请求体 `{"digest": "<提案摘要>"}`。
+  - 只有三名受邀见证人可确认：发起人本人、其他账号、不可见编号一律 `403`；
+  - **摘要不符**（不等于提案摘要）`409` 拒绝且**不计票**、不留任何确认记录；
+  - **同一见证人重复确认** `409`，只计一次（`UNIQUE(proposal_id, witness_id)`）；
+  - 已撤回/已失效/已完成提案上的确认均 `409`；已过截止时刻的确认 `409`。
+  - 每次有效确认返回最新 `confirmation_count` 与 `sealed`（是否已集齐封存）。
+    **第三名见证人在截止前确认成功的同一写事务内**，服务端沿用直接封存的
+    现有规则生成一份正式封存资料（同正文摘要、同发起人、同三名见证人，
+    追加既有 `seal` 审计），响应给出 `status: "sealed"`、`sealed: true` 与
+    `document_id`；同时把提案正文清空。此后该资料与直接封存的资料完全等价
+    （可申请开封、两票同意、交接、清除、审计快照等）。
+  - **重复请求不得再生成资料**：完成后的任何确认都 `409`；`document_id`
+    部分唯一索引与 `WHERE status='pending'` 条件更新共同兜底，并发第三票也
+    只会生成一份资料。
+- `POST /pre-seal-proposals/{id}/revoke`（需发起人本人密钥）：在提案完成前
+  撤回；他人/不可见编号统一 `403`，已撤回/已失效/已完成 `409`。撤回后已有
+  确认全部作废（保留记录与计数用于审计展示）、提案正文清空。
+- **到期失效**：截止时刻到达时仍未集齐三人，提案置 `expired`、正文清空；
+  后台扫描器、GET 查询、确认与撤回临界区都会在写事务内做确定性判定，不依赖
+  扫描及时性。失效后不可再确认或撤回。
+- **并发顺序**：确认、撤回、到期判定与 API Key 轮换共用同一把
+  `BEGIN IMMEDIATE` 写锁，全部“检查 + 写入”在同一短事务内，按已提交顺序
+  产生唯一终态——第三票确认与发起人撤回赛跑时，要么生成资料（撤回 `409`），
+  要么撤回成功（确认 `409`）；轮换先提交时，持旧密钥的确认/撤回升既有
+  `401` 并整体回滚（不计票、不生成资料、不留封存审计），见证人改用新密钥
+  后可正常补票。
+- **审计**：发起/每次确认/撤回/失效/完成分别追加 `pre_seal_proposed`、
+  `pre_seal_confirmed`、`pre_seal_revoked`、`pre_seal_expired`、
+  `pre_seal_completed`；生成正式资料时同时追加既有 `seal` 审计（挂在新资料
+  编号下，`pre_seal_completed` 同样带该资料编号）。任何失败确认/撤回不留
+  业务记录、不产生资料或封存审计。预封存不触发站内通知。
+
+```bash
+# 发起预封存（截止时刻取 24 小时后，支持 +08:00 等带时区写法）
+DEADLINE=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=24)).isoformat())")
+curl -sS -X POST $BASE/pre-seal-proposals \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d "{\"body\":\"遗嘱正文……\",\"witnesses\":[\"bob\",\"carol\",\"dave\"],\"confirm_deadline\":\"$DEADLINE\"}"
+# -> {"proposal_id":1,"owner_username":"alice","digest":"ab12…","status":"pending",
+#     "required":3,"confirmation_count":0,"witnesses":["bob","carol","dave"],
+#     "document_id":null,...}   # 无 body
+
+# 仅发起人/受邀见证人可查；其他人凭编号统一 403
+curl -sS $BASE/pre-seal-proposals/1 -H "X-API-Key: $W1_KEY"
+curl -sS -o /dev/null -w '%{http_code}\n' $BASE/pre-seal-proposals/1 -H "X-API-Key: $OTHER_KEY"
+# -> 403
+
+# 三名见证人各凭摘要确认一次（错误摘要/重复确认 -> 409，不计票）
+curl -sS -X POST $BASE/pre-seal-proposals/1/confirmations -H "X-API-Key: $W1_KEY" \
+  -H 'Content-Type: application/json' -d '{"digest":"ab12…"}'
+# -> {"confirmation_count":1,"sealed":false,...}
+curl -sS -X POST $BASE/pre-seal-proposals/1/confirmations -H "X-API-Key: $W2_KEY" \
+  -H 'Content-Type: application/json' -d '{"digest":"ab12…"}'
+# -> {"confirmation_count":2,"sealed":false,...}
+curl -sS -X POST $BASE/pre-seal-proposals/1/confirmations -H "X-API-Key: $W3_KEY" \
+  -H 'Content-Type: application/json' -d '{"digest":"ab12…"}'
+# -> {"confirmation_count":3,"sealed":true,"status":"sealed","document_id":7,...}
+
+# 生成的正式资料沿用现有规则：开封前无正文，可走既有两票开封流程
+curl -sS $BASE/documents/7 -H "X-API-Key: $OWNER_KEY"   # status=sealed，无 body
+
+# 完成前发起人可撤回；截止未集齐则自动 expired（两种终态提案正文都清空）
+curl -sS -X POST $BASE/pre-seal-proposals/2/revoke -H "X-API-Key: $OWNER_KEY"
+# -> {"proposal_id":2,"status":"revoked","confirmation_count":1,...}
+```
+
+可运行的端到端示例：`python examples/demo_pre_seal.py`
+（覆盖发起校验、可见性、摘要不符/重复确认不计票、三人集齐事务内封存并两票
+开封、撤回与到期清空正文、失败不生成资料）。
 
 ### 替换指定见证人（witness replacement）
 
@@ -839,6 +950,7 @@ curl -sS $BASE/documents/1/audit -H "X-API-Key: $OWNER_KEY"
 ```bash
 bash examples/demo.sh                    # curl 版（未设最早开封时刻的基础流程）
 python3 examples/demo.py                 # 纯标准库 Python 版
+python3 examples/demo_pre_seal.py        # 预封存：发起/仅参与方可见/凭摘要确认/三人集齐事务内封存/撤回与到期清空正文/失败不生成资料
 python3 examples/demo_scheduled.py       # 最早开封时刻：waiting -> 自动开封；补票立即开封
 python3 examples/demo_replace_witness.py # 见证人替换：直接换人 / 退票补票 / waiting 退回待同意
 python3 examples/demo_handover.py        # 封存人交接：邀请/撤回/逾期/确认失效旧请求/转移身份/开封后邀请失效
@@ -875,6 +987,17 @@ python -m pytest -q
 立即开封、迟到撤销/迟到扫描不能作废已到点开封、停机期间到点的重启恢复、
 开封前正文零泄露、审计顺序，以及基于真实 uvicorn + 多线程的
 **并发同意/同意撤销赛跑**（验证只产生一个已提交终态）和**重启一致性**；
+另含**预封存提案**：发起校验（三人互异/非本人/已注册、带时区未来截止时刻、
+响应不含正文）、仅发起人及受邀见证人可见（他人凭编号统一 403、完成前不进
+资料列表）、见证人凭摘要确认（摘要不符拒绝不计票、重复确认只计一次、非受邀
+403）、三人截止前确认在同一事务生成沿用现有规则的封存资料并返回资料编号
+（既有两票开封可正常读取正文）、完成后重复请求不再生成资料、失败不产生资料
+或封存审计、发起人撤回权限与终态、截止未集齐即失效（扫描器/GET/确认/撤回
+临界区三种确定性判定）、撤回/失效/完成后库内提案正文清空而正式资料正文保留、
+停机期间到点的重启恢复与未到期提案重启后续票封存，以及真实 uvicorn + 多线程的
+**并发重复确认只计一票**、**第三票确认 vs 发起人撤回赛跑**（唯一封存/撤回终态）、
+**第三名见证人持旧密钥确认 vs 本人密钥轮换赛跑**（轮换先提交则 401 回滚不计票、
+业务写先提交则封存）；
 另含见证人替换：直接换人后旧见证人失去权限、进行中请求退票（被替换者同意失效、
 其他同意保留）、新见证人凭摘要补票开封、`waiting` 替换投票者退回 `pending`
 （替换未投票者维持 `waiting`）、到点两票已齐先开封并拒绝替换、过截止请求先
@@ -932,14 +1055,14 @@ python -m pytest -q
 app/
   config.py     # 环境变量配置
   db.py         # SQLite 连接、建表与旧库幂等迁移、BEGIN IMMEDIATE 写事务、时间规范
-  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、阅览凭证、快照验真入参校验）
+  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、预封存提案/确认、替换见证人、交接邀请、清除时刻、阅览凭证、快照验真入参校验）
   ed25519.py    # Ed25519 签名（RFC 8032）纯标准库实现，无第三方依赖
   snapshots.py  # 审计快照：canonical-json-v1 规范化、签名密钥持久化、公钥 PEM/指纹、快照组装与签名
-  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销、站内通知投递/游标分页/标记已读、API Key 轮换与写锁内密钥复核）
+  main.py       # FastAPI 路由、认证、定时开封+到期清除+预封存/交接过期扫描器、全部业务规则（预封存提案发起/查看/凭摘要确认/事务内封存/撤回/到期、见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销、站内通知投递/游标分页/标记已读、API Key 轮换与写锁内密钥复核）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py / demo_notifications.py / demo_api_key_rotation.py 端到端示例
-tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、阅览凭证、站内通知、密钥轮换、并发、重启）
+examples/       # demo.sh / demo.py / demo_pre_seal.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py / demo_notifications.py / demo_api_key_rotation.py 端到端示例
+tests/          # pytest 测试（功能、定时、预封存、替换见证人、交接、到期清除、审计快照、阅览凭证、站内通知、密钥轮换、并发、重启）
 Dockerfile
 docker-compose.yml
 ```

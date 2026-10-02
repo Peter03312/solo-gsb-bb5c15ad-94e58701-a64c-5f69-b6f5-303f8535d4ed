@@ -131,6 +131,44 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_recipient_event
 CREATE INDEX IF NOT EXISTS idx_notifications_recipient_seq
     ON notifications(recipient_id, event_seq, id);
 
+-- 预封存提案：封存人先提交正文、三名已注册且互异（不含本人）的见证人及
+-- 带时区的未来确认截止时刻；见证人凭提案摘要各确认一次，截止前集齐三人
+-- 即在同一事务内按现有封存规则生成正式封存资料。仅发起人（owner）与受邀
+-- 见证人可见，其他账号不可凭编号探知。撤回（revoked）/失效（expired）/
+-- 完成（sealed）后正文一律清空（body 置 ''），只保留摘要与审计元数据。
+CREATE TABLE IF NOT EXISTS pre_seal_proposals (
+    id               INTEGER PRIMARY KEY,
+    owner_id         INTEGER NOT NULL REFERENCES users(id),
+    body             TEXT NOT NULL DEFAULT '',  -- 仅 pending 期间暂存正文；撤回/失效/完成后清空
+    digest           TEXT NOT NULL,             -- 正文 SHA-256，见证人确认时须比对一致
+    confirm_deadline TEXT NOT NULL,             -- 带时区确认截止时刻（UTC 存储，字符串可排序）
+    status           TEXT NOT NULL CHECK (status IN ('pending', 'sealed', 'revoked', 'expired')),
+    document_id      INTEGER REFERENCES documents(id),  -- sealed 后同事务生成的正式资料编号
+    created_at       TEXT NOT NULL,
+    resolved_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pre_seal_status ON pre_seal_proposals(status);
+
+CREATE TABLE IF NOT EXISTS pre_seal_witnesses (
+    id           INTEGER PRIMARY KEY,
+    proposal_id  INTEGER NOT NULL REFERENCES pre_seal_proposals(id) ON DELETE CASCADE,
+    user_id      INTEGER NOT NULL REFERENCES users(id),
+    position     INTEGER NOT NULL,             -- 按发起提交顺序占位，生成正式资料时沿用
+    UNIQUE(proposal_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS pre_seal_confirmations (
+    id           INTEGER PRIMARY KEY,
+    proposal_id  INTEGER NOT NULL REFERENCES pre_seal_proposals(id) ON DELETE CASCADE,
+    witness_id   INTEGER NOT NULL REFERENCES users(id),
+    bound_digest TEXT NOT NULL,                -- 确认时绑定的提案摘要（须等于提案摘要才计票）
+    created_at   TEXT NOT NULL,
+    UNIQUE(proposal_id, witness_id)            -- 同一见证人对同一提案只能确认一次
+);
+-- 一份提案至多生成一份正式封存资料（状态机之外的数据库级兜底）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_seal_one_document
+    ON pre_seal_proposals(document_id) WHERE document_id IS NOT NULL;
+
 -- 审计快照签名密钥：单行表，首次使用时生成并持久化，
 -- 重启后旧快照签名仍可验证；secret_seed 仅服务端持有，任何接口不返回。
 CREATE TABLE IF NOT EXISTS signing_keys (
