@@ -13,6 +13,27 @@ class SealIn(BaseModel):
     witnesses: list[str] = Field(min_length=3, max_length=3)
 
 
+class PreSealIn(BaseModel):
+    """预封存提案：正文 + 三名互异且非本人的已注册见证人 + 带时区未来截止时刻。"""
+
+    body: str = Field(min_length=1, max_length=1_000_000)
+    witnesses: list[str] = Field(min_length=3, max_length=3)
+    confirm_deadline: datetime  # 必须带时区，例如 2026-10-01T12:00:00Z
+
+    @field_validator("confirm_deadline")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("确认截止时刻必须带时区信息，例如 2026-10-01T12:00:00Z")
+        return v
+
+
+class PreSealConfirmIn(BaseModel):
+    """见证人凭提案摘要确认预封存。"""
+
+    digest: str = Field(min_length=1, max_length=128)
+
+
 class OpenRequestIn(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
     deadline: datetime  # 必须带时区，例如 2026-10-01T12:00:00Z

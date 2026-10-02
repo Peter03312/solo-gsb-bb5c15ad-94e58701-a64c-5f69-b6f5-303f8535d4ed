@@ -141,6 +141,44 @@ CREATE TABLE IF NOT EXISTS signing_keys (
     secret_seed TEXT NOT NULL,             -- 32 字节签名种子（hex），服务端保密
     created_at  TEXT NOT NULL
 );
+
+-- 预封存提案：封存人先提交正文、三名互异且非本人的已注册见证人、以及带时区的
+-- 未来确认截止时刻；三名见证人在截止前各凭提案摘要确认一次（UNIQUE 兜底
+-- 每人至多一票）后，在第三票的同一写事务内按“现有封存规则”生成一份普通
+-- 封存资料（documents + document_witnesses + seal 审计）。仅发起人本人与
+-- 受邀见证人可凭编号查看；其他账号（含凭编号试探）统一 403，不区分是否存在。
+-- body 仅在 pending 期间保留：撤回（revoked）、失效（expired）或完成
+-- （confirmed）后立即清空（置空串），任何接口都不再返回提案正文。
+CREATE TABLE IF NOT EXISTS pre_seal_proposals (
+    id               INTEGER PRIMARY KEY,
+    owner_id         INTEGER NOT NULL REFERENCES users(id),
+    body             TEXT NOT NULL,            -- 仅 pending 期间保留；终结后清空为 ''
+    digest           TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('pending', 'confirmed', 'revoked', 'expired')),
+    deadline         TEXT NOT NULL,            -- 带时区确认截止时刻（UTC 存储，字符串可排序）
+    document_id      INTEGER REFERENCES documents(id),  -- confirmed 后在同事务生成的资料编号
+    created_at       TEXT NOT NULL,
+    resolved_at      TEXT                      -- 撤回/失效/完成时刻
+);
+CREATE INDEX IF NOT EXISTS idx_pre_seal_proposals_status ON pre_seal_proposals(status);
+
+CREATE TABLE IF NOT EXISTS pre_seal_witnesses (
+    id           INTEGER PRIMARY KEY,
+    proposal_id  INTEGER NOT NULL REFERENCES pre_seal_proposals(id) ON DELETE CASCADE,
+    user_id      INTEGER NOT NULL REFERENCES users(id),
+    position     INTEGER NOT NULL,
+    UNIQUE(proposal_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS pre_seal_confirmations (
+    id           INTEGER PRIMARY KEY,
+    proposal_id  INTEGER NOT NULL REFERENCES pre_seal_proposals(id) ON DELETE CASCADE,
+    witness_id   INTEGER NOT NULL REFERENCES users(id),
+    bound_digest TEXT NOT NULL,                 -- 确认时提交并比对的提案摘要
+    created_at   TEXT NOT NULL,
+    UNIQUE(proposal_id, witness_id)             -- 同一见证人对同一提案至多确认一次
+);
+CREATE INDEX IF NOT EXISTS idx_pre_seal_confirmations_proposal ON pre_seal_confirmations(proposal_id);
 """
 
 

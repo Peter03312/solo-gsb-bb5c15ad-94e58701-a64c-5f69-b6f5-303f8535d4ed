@@ -21,6 +21,12 @@
 判定。资料开封、到期清除、见证人替换与交接确认
 时，系统还会在状态变更的同一事务内向当时的封存人/见证人**投递站内通知**，
 账号凭现有 `X-API-Key` 以事件序号游标分页读取本人通知、按通知编号标记已读。
+封存人还可发起**需见证人确认的预封存**：提交正文、三名互异且非本人的已注册
+见证人及带时区的未来确认截止时刻，取得提案编号与正文摘要（响应不含正文）；
+仅发起人本人与受邀见证人可凭编号查看提案，见证人凭摘要各确认一次（摘要不符、
+重复确认拒绝且不计票），三人在截止前确认后在同一事务内按现有规则生成一份
+封存资料并返回资料编号，重复请求不再生成资料；发起人可在完成前撤回，截止时
+未集齐即失效，撤回/失效/完成后立即清空提案正文。
 技术栈：Python 3.11 + FastAPI + SQLite。
 
 ## 安全与业务规则
@@ -31,6 +37,10 @@
 | 密钥轮换 | `POST /me/api-key/rotate` 凭**当前**密钥换取新密钥：新明文为 256 位随机串、**仅本次响应返回一次**，库内只保存其 SHA-256 摘要（旧摘要被覆盖，不保留历史密钥），旧密钥自轮换提交后立即失效并随 WAL 持久化（重启后仍失效）；轮换本身追加一条 `api_key_rotated` 审计（不含密钥材料） |
 | 轮换与业务写并发 | 所有已认证写操作在 `BEGIN IMMEDIATE` 锁内先复核密钥是否仍是当前摘要：**轮换先提交**则持旧密钥并发的封存/同意/撤销/替换/交接/清除安排/签发凭证/撤销凭证/标记已读/签发快照一律 `401` 并整体回滚——业务写入不生效、不留下业务审计，也不触发连带结算；**业务写先提交**则照常完成，轮换随后提交。无效或已失效密钥沿用既有 `401`，不区分账号是否存在；未轮换账号与无需登录的兑换/验真行为不变 |
 | 封存需三名不同见证人 | 封存时校验三人互异、均已注册、且不含封存人本人 |
+| 预封存提案 | 封存人可发起需见证人确认的预封存：提交正文、三名互异且非本人的已注册见证人及带时区未来确认截止时刻；响应只给提案编号与 SHA-256 摘要，**不含正文**。仅发起人本人与三名受邀见证人可凭编号查看摘要/截止时刻/状态/确认人数，其他账号（含凭编号试探、不存在编号）统一 `403` 不区分是否存在 |
+| 预封存确认 | 三名受邀见证人凭提案摘要在截止前各确认一次：摘要不符、重复确认一律 `409` 拒绝且不计票（`UNIQUE(proposal_id, witness_id)` 兜底）；非受邀见证人/发起人本人确认统一 `403` |
+| 三人齐生成资料 | 第三名不同见证人确认的**同一写事务内**按“现有封存规则”生成一份普通封存资料（documents + 见证名单 + `seal` 审计，与直接封存完全一致）并返回 `document_id`；提案置 `confirmed` 并清空正文。已完成提案的任何重复确认/重复请求一律 `409`，**不再生成第二份资料** |
+| 预封存撤回/到期 | 发起人可在完成前撤回（`revoked`）；截止时刻未集齐三人即失效（`expired`，后台扫描器、每个提案写事务与提案查询都做确定性到期判定，停机期间到期重启恢复扫描补结算）；撤回、失效、完成后提案正文立即从库中清空，迟到确认/撤回一律 `409`；失败与不确认不产生资料或封存审计 |
 | 保存正文及摘要 | 正文原文与 SHA-256 摘要同表保存；封存后无任何更新接口，内容不可改 |
 | 开封前不泄露正文 | 封存/待开封状态下查询/列表/错误响应均不含 `body`；非参与方一律 `403`，不区分资料是否存在 |
 | 开封请求 | 封存人提交 `reason` 与带时区的 `deadline`（必须晚于当前时间） |
@@ -158,6 +168,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/me` | 查询当前密钥对应的账号 |
 | POST | `/me/api-key/rotate` | 凭当前 `X-API-Key` 轮换密钥：新明文 `api_key` 仅本次响应返回一次，旧密钥即刻失效 |
 | POST | `/documents` | 封存资料：`{body, witnesses:[3人]}`，返回 `digest`（无正文） |
+| POST | `/pre-seal-proposals` | 发起需见证人确认的预封存：`{body, witnesses:[3人], confirm_deadline}`，返回提案编号与摘要（无正文） |
+| GET | `/pre-seal-proposals/{id}` | 查看提案（仅发起人/受邀见证人）：摘要、截止时刻、状态、确认人数、完成后的资料编号；不含正文 |
+| POST | `/pre-seal-proposals/{id}/confirmations` | 受邀见证人凭摘要确认：`{digest}`；第三票同事务生成封存资料并返回 `document_id` |
+| POST | `/pre-seal-proposals/{id}/revoke` | 发起人在完成前撤回预封存提案 |
 | GET | `/documents` | 列出本人封存/见证的资料（仅元数据，含 `purge_at`/`purged_at`） |
 | GET | `/documents/{id}` | 详情；开封后才含 `body`、`reason`、`witness_approvals`；已清除返回 `purged` 与清除时刻 |
 | POST | `/documents/{id}/open-requests` | 封存人提交开封请求：`{reason, deadline, earliest_open_at?}` |
@@ -190,6 +204,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 新见证人已在名单、资料已开封仍替换、重复发起待确认交接邀请、确认已撤回/逾期/
 已确认的邀请、交接时资料已开封、资料已清除仍开封/替换/交接/安排清除/签发阅览凭证、
 清除时刻已到仍改期/取消、无清除安排仍取消、撤销已兑付/已撤销/已过期凭证等）`409`。
+预封存接口：三名见证人不互异/含发起人本人、见证人未注册、确认截止时刻已过为
+`400`；时间不带时区为 `422`；非参与方查看/确认、发起人本人确认、非受邀见证人
+确认、非发起人撤回、凭不存在编号访问统一 `403`（不区分提案是否存在）；摘要不符、
+同一见证人重复确认、已完成提案再确认/撤回、已撤回/已失效提案再操作、到期后
+迟到确认或撤回为 `409`；无/错凭据 `401`。
 凭证兑换的全部失败（无效明文、过期、撤销、已兑付、资料已清除）统一
 **`404` 同一文案**，不区分原因、不泄露正文或资料存在性。
 通知接口：游标或页大小非法为 `422`；标记他人或不存在的通知编号统一 `403`
@@ -526,6 +545,113 @@ curl -sS $BASE/me -H "X-API-Key: $NEW_KEY"
 （覆盖单次/再次轮换、旧密钥读写 401、无效密钥同文案、未轮换账号与无凭据
 接口不受影响）。
 
+### 需见证人确认的预封存（pre-seal proposal）
+
+封存人希望**先取得三名见证人确认、再正式封存**时，可发起预封存提案：
+
+- `POST /pre-seal-proposals`（需 `X-API-Key`），请求体
+  `{"body": "<正文>", "witnesses": ["bob","carol","dave"],
+  "confirm_deadline": "<带时区 ISO-8601 未来时刻>"}`。发起规则与直接封存一致：
+  三名见证人**互异、均已注册、且不含封存人本人**；`confirm_deadline` 必须
+  带时区且晚于当前（不带时区 `422`、已过 `400`）。成功 `201`：
+
+  ```json
+  {
+    "proposal_id": 1,
+    "status": "pending",
+    "digest": "270463ae1237111ba6ce2460897332ea3661f003813e3ef92591df7e92891f6d",
+    "confirm_deadline": "2026-10-03T16:00:00.000000+00:00",
+    "witnesses": ["bob", "carol", "dave"],
+    "confirmation_count": 0,
+    "required": 3,
+    "document_id": null,
+    "created_at": "2026-10-02T15:00:00.000000+00:00",
+    "resolved_at": null
+  }
+  ```
+
+  响应（及任何错误体）**不含正文**，只给提案编号与正文的 SHA-256 摘要，
+  由封存人把摘要与提案编号转交给三名见证人。
+- **仅发起人本人与三名受邀见证人**可凭编号查看
+  `GET /pre-seal-proposals/{id}`（摘要、截止时刻、状态、确认人数、完成后的
+  资料编号；始终不含正文）。其他账号（含凭任意编号试探）与不存在编号统一
+  `403` `{"detail":"无权访问该预封存提案或提案不存在"}`，无法探知提案存在性；
+  无凭据 `401`。
+- `POST /pre-seal-proposals/{id}/confirmations`（需受邀见证人本人密钥），
+  请求体 `{"digest": "<提案摘要>"}`。见证人凭摘要各确认一次：
+  - **摘要不符** → `409` 拒绝，不计票（本人之后提交正确摘要仍可确认）；
+  - **同一见证人重复确认** → `409`，只计一次（预检 + `UNIQUE(proposal_id,
+    witness_id)` 双保险，并发重复也至多一票）；
+  - 非受邀见证人、发起人本人、其他账号或不存在提案 → 统一 `403`。
+  - 前两票响应为 `{"status":"pending","confirmation_count":1|2,
+    "document_id":null,…}`；**第三名不同见证人确认后**，在该确认的**同一
+    `BEGIN IMMEDIATE` 写事务内**按“现有封存规则”生成一份普通封存资料
+    （`documents` 行、三名见证人、一条 `seal` 审计——与 `POST /documents`
+    完全一致），响应 `status:"confirmed"` 并返回 `document_id`。
+- **重复请求不再生成资料**：提案一旦 `confirmed`，任何确认（含原见证人、
+  发起人）都返回 `409`（发起人/非见证人仍为 `403`），撤回也 `409`；
+  `pre_seal_proposals.document_id` 固定指向唯一一份资料，库中不会出现第二份。
+- `POST /pre-seal-proposals/{id}/revoke`（仅发起人）：在完成（或到期）前
+  撤回；非发起人统一 `403`；已完成/已撤回 `409`。
+- **到期必失效**：截止时刻未集齐三人确认，提案置 `expired`。后台扫描器
+  每秒一轮处理；每个提案写事务（确认/撤回）与提案查询进入临界区时也都先做
+  确定性到期判定——即使扫描器停机，重启时的恢复扫描或之后任意参与方的请求
+  都会补结算。已失效提案的迟到确认、撤回一律 `409`，不产生资料。
+- **正文最小化保留**：提案正文只在 `pending` 期间存于
+  `pre_seal_proposals.body`；**撤回、失效或完成后立即清空**（置空串，WAL
+  持久化）。成功生成的封存资料其正文按现有封存规则保留在 `documents`
+  （仍受开封/清除规则保护）；提案本身的任何接口在任何状态下都不返回正文。
+- **并发唯一结果**：确认、撤回、到期结算与密钥轮换共用同一把写锁，按已提交
+  顺序产生唯一结果——第三票确认与撤回赛跑，要么 `confirmed`（生成一份资料）
+  要么 `revoked`（不生成），互斥且唯一；**轮换先提交**则持旧密钥的确认/撤回
+  一律 `401` 并整体回滚（不生成资料、不写 `seal` 审计、不触发到期结算写入，
+  旧密钥的读请求同样不得借读路径完成到期写入），**业务写先提交**则照常生成
+  资料，随后轮换完成。
+- 生成的资料与直接封存**完全同质**：封存人可对其提交开封请求、两票开封、
+  替换见证人、交接、安排清除、签发阅览凭证与审计快照；审计链从 `seal`
+  开始，快照与既有格式一致（不含预存流程信息）。直接封存接口与
+  `X-API-Key` 认证约定保持可用、行为不变。
+
+```bash
+# 发起预封存（响应只有 proposal_id 与 digest，无正文）
+DEADLINE=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=24)).isoformat())")
+curl -sS -X POST $BASE/pre-seal-proposals \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d "{\"body\":\"遗嘱正文……\",\"witnesses\":[\"bob\",\"carol\",\"dave\"],\"confirm_deadline\":\"$DEADLINE\"}"
+# -> {"proposal_id":1,"status":"pending","digest":"270463…","confirmation_count":0,"document_id":null,...}
+
+# 发起人/见证人查看；其他账号（含不存在编号）统一 403
+curl -sS $BASE/pre-seal-proposals/1 -H "X-API-Key: $OWNER_KEY"
+curl -sS -o /dev/null -w '%{http_code}\n' $BASE/pre-seal-proposals/1 -H "X-API-Key: $OTHER_KEY"
+# -> 403
+
+# 三名见证人各凭摘要确认一次（重复确认/摘要不符 409 且不计票）
+curl -sS -X POST $BASE/pre-seal-proposals/1/confirmations -H "X-API-Key: $W1_KEY" \
+  -H 'Content-Type: application/json' -d '{"digest":"270463…"}'
+# -> {"status":"pending","confirmation_count":1,"document_id":null,...}
+curl -sS -X POST $BASE/pre-seal-proposals/1/confirmations -H "X-API-Key: $W2_KEY" \
+  -H 'Content-Type: application/json' -d '{"digest":"270463…"}'
+curl -sS -X POST $BASE/pre-seal-proposals/1/confirmations -H "X-API-Key: $W3_KEY" \
+  -H 'Content-Type: application/json' -d '{"digest":"270463…"}'
+# -> {"status":"confirmed","confirmation_count":3,"document_id":7,...}
+
+# 生成的资料沿用现有接口（GET /documents/7、open-requests、audit、audit-snapshots …）
+curl -sS $BASE/documents/7 -H "X-API-Key: $OWNER_KEY"   # sealed，无 body
+
+# 完成前撤回（撤回/失效/完成后提案正文立即清空）
+curl -sS -X POST $BASE/pre-seal-proposals/2/revoke -H "X-API-Key: $OWNER_KEY"
+# -> {"proposal_id":2,"status":"revoked",...}
+
+# 拒绝示例（均不改状态、不泄露正文/存在性）：
+#   三人不互异/含本人 400；见证人未注册 400；截止时刻已过 400；不带时区 422；
+#   非参与方查看/确认、非发起人撤回、凭不存在编号 -> 403；无/错密钥 -> 401；
+#   摘要不符、重复确认、已完成再确认/撤回、已撤回/已失效再操作、到期后迟到 -> 409。
+```
+
+可运行的端到端示例：`python examples/demo_pre_seal.py`
+（覆盖发起校验与无正文响应、参与方可见性、摘要不符/重复确认不计票、三人齐
+同事务生成资料并沿用两票开封、完成前撤回、到期失效与正文清空）。
+
 ### 一次性阅览凭证（view pass）
 
 当前封存人需要把**已开封**资料的正文临时交给一名**没有服务账号**的外部复核人时，
@@ -847,6 +973,7 @@ python3 examples/demo_audit_snapshot.py  # 审计快照：签发/验真/篡改�
 python3 examples/demo_view_pass.py       # 一次性阅览凭证：签发/无账号兑换一次/再兑换404/兑换前撤销
 python3 examples/demo_notifications.py   # 站内通知：开封/替换/交接/清除投递、游标分页、标记已读与拒绝场景
 python3 examples/demo_api_key_rotation.py # 密钥轮换：一次性返回/旧密钥即时持久失效/401同文案/未轮换与无凭据接口不变
+python3 examples/demo_pre_seal.py        # 预封存：三人凭摘要确认同事务生成资料/重复不计票/撤回/到期失效/正文清空
 ```
 
 ### 典型拒绝场景
@@ -925,6 +1052,16 @@ python -m pytest -q
 行为不变，以及真实 uvicorn + 多线程的**同密钥并发轮换只产生一个赢家**、
 **轮换先提交则旧密钥封存 401 回滚**、**业务写先提交则封存落库后轮换完成**、
 **旧密钥读请求不得触发到点清除写入**四类并发/时序用例。
+预封存提案测试覆盖：发起校验（三人互异/已注册/非本人、截止时刻带时区且在未来）、
+响应不含正文、仅发起人/受邀见证人可见（其他账号与不存在编号统一 403）、
+摘要不符与重复确认 409 且不计票、非受邀见证人/发起人本人不能确认、非发起人不能
+撤回、三人在截止前确认后在同一事务生成一份普通封存资料（`seal` 审计与直接封存
+一致、见证人名单一致、开封前无正文）、已完成提案重复确认/撤回不再生成资料、
+完成前撤回后不能确认、到期扫描器失效与无扫描器时查询/确认事务的确定性失效、
+迟到第三票不产生资料、撤回/失效/完成后库中提案正文清空、生成资料沿用两票开封与
+审计快照、旧密钥轮换先提交则确认/撤回 401 回滚（无资料、无封存审计）、旧密钥
+读请求不得触发到期写入，以及真实 uvicorn + 多线程的**第三票/撤回并发唯一终态**、
+**第三票 vs 密钥轮换并发按提交顺序唯一结果**与**停机期间到期重启恢复**。
 
 ## 项目结构
 
@@ -932,14 +1069,14 @@ python -m pytest -q
 app/
   config.py     # 环境变量配置
   db.py         # SQLite 连接、建表与旧库幂等迁移、BEGIN IMMEDIATE 写事务、时间规范
-  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、阅览凭证、快照验真入参校验）
+  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、阅览凭证、预封存提案/确认、快照验真入参校验）
   ed25519.py    # Ed25519 签名（RFC 8032）纯标准库实现，无第三方依赖
   snapshots.py  # 审计快照：canonical-json-v1 规范化、签名密钥持久化、公钥 PEM/指纹、快照组装与签名
-  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销、站内通知投递/游标分页/标记已读、API Key 轮换与写锁内密钥复核）
+  main.py       # FastAPI 路由、认证、定时开封+到期清除+预封存到期+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销、站内通知投递/游标分页/标记已读、API Key 轮换与写锁内密钥复核、预封存提案发起/查看/确认/撤回与三人齐同事务生成资料）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py / demo_notifications.py / demo_api_key_rotation.py 端到端示例
-tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、阅览凭证、站内通知、密钥轮换、并发、重启）
+examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py / demo_notifications.py / demo_api_key_rotation.py / demo_pre_seal.py 端到端示例
+tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、阅览凭证、站内通知、密钥轮换、预封存提案、并发、重启）
 Dockerfile
 docker-compose.yml
 ```

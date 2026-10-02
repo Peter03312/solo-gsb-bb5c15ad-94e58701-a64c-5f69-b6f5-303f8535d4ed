@@ -64,6 +64,18 @@
   回滚——既不生效，也不留下业务审计；业务写入先提交则照常完成，之后旧密钥
   失效。无效或已失效密钥一律沿用现有 401（不区分账号是否存在，不留任何记录）；
   未轮换账号以及无需登录的阅览兑换、快照验真行为完全保持原样。
+- 封存人可发起**需见证人确认的预封存**：提交正文、三名互异且非本人的已注册
+  见证人及带时区的未来确认截止时刻，取得提案编号与正文摘要（响应不含正文）。
+  仅发起人本人与受邀见证人可凭编号查看提案的摘要、截止时刻、状态与确认人数，
+  其他账号（含凭编号试探）统一 403，不区分提案是否存在。见证人凭摘要各确认
+  一次：摘要不符、重复确认一律拒绝且不计票（UNIQUE 兜底）。三人在截止前
+  确认后，在第三票的同一写事务内按“现有封存规则”生成一份普通封存资料并返回
+  资料编号（seal 审计与直接封存完全一致）；已生成资料的提案重复请求不得再
+  生成资料。发起人可在完成前撤回；截止时未集齐三人即失效；撤回、失效或
+  完成后提案正文立即清空。确认、撤回、到期结算与密钥轮换并发时按 BEGIN
+  IMMEDIATE 已提交顺序产生唯一结果（轮换先提交则持旧密钥的确认/撤回 401
+  回滚，不产生资料或封存审计）；后台扫描器与每个提案写事务/提案查询都做
+  确定性到期判定，停机期间到期在重启恢复扫描时补结算。
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 - 站内通知：资料开封（opened）或到期清除（purged）时，在状态变更的同一写
   事务内向“当时封存人 + 三名见证人”各记一条；见证人替换（witness_replaced）
@@ -102,6 +114,8 @@ from .schemas import (
     AuditSnapshotIn,
     HandoverIn,
     OpenRequestIn,
+    PreSealConfirmIn,
+    PreSealIn,
     PurgeIn,
     RegisterIn,
     ReplaceWitnessIn,
@@ -543,6 +557,37 @@ def expire_due_invitations(tx: sqlite3.Connection, now: str, invitation_id: int 
     return len(rows)
 
 
+def expire_due_pre_seal_proposals(
+    tx: sqlite3.Connection, now: str, proposal_id: int | None = None
+) -> int:
+    """在已持有的写事务内把已过确认截止时刻仍 pending 的预封存提案确定性置为
+    expired，并立即清空提案正文。
+
+    与到点开封/交接邀请逾期同理：扫描器、每个提案写事务与提案查询进入临界区
+    后都先调用本函数，到期结论不依赖后台扫描器及时性；截止时未集齐三人确认即
+    失效，撤回/失效/完成后正文一律不在库中保留。返回本次失效条数。
+    """
+    if proposal_id is not None:
+        rows = tx.execute(
+            "SELECT id FROM pre_seal_proposals"
+            " WHERE id = ? AND status = 'pending' AND deadline <= ?",
+            (proposal_id, now),
+        ).fetchall()
+    else:
+        rows = tx.execute(
+            "SELECT id FROM pre_seal_proposals"
+            " WHERE status = 'pending' AND deadline <= ?",
+            (now,),
+        ).fetchall()
+    for row in rows:
+        tx.execute(
+            "UPDATE pre_seal_proposals SET status='expired', body='', resolved_at=?"
+            " WHERE id=? AND status='pending'",
+            (now, row["id"]),
+        )
+    return len(rows)
+
+
 class ExpirySweeper:
     def __init__(self) -> None:
         self._task: asyncio.Task[None] | None = None
@@ -575,8 +620,9 @@ class ExpirySweeper:
     def sweep_once() -> int:
         """一轮定时处理：先把到点的 waiting 请求开封（清除优先的不开），
         再把到清除时刻的资料清除正文，然后把过截止时刻仍
-        pending（票数不足）的请求置为 expired，最后把过确认截止时刻仍
-        pending 的交接邀请置为 expired；返回失效（expired）请求条数。"""
+        pending（票数不足）的请求置为 expired，再把过确认截止时刻仍
+        pending 的交接邀请置为 expired，最后把过确认截止时刻仍 pending 的
+        预封存提案置为 expired（同时清空提案正文）；返回失效（expired）请求条数。"""
         conn = connect()
         try:
             with write_tx(conn) as tx:
@@ -608,6 +654,9 @@ class ExpirySweeper:
                     )
                 # 第四步：过确认截止时刻仍待确认的交接邀请失效（逾期后可重新邀请）。
                 expire_due_invitations(tx, now)
+                # 第五步：过确认截止时刻仍待确认的预封存提案失效并清空提案正文
+                #（未集齐三名见证人确认即失效，不产生资料或封存审计）。
+                expire_due_pre_seal_proposals(tx, now)
                 return len(rows)
         finally:
             conn.close()
@@ -631,7 +680,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -788,6 +837,45 @@ def health() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def create_sealed_document(
+    tx: sqlite3.Connection,
+    *,
+    owner_id: int,
+    body: str,
+    witness_ids: list[int],
+    witness_names: list[str],
+    actor_id: int,
+    now: str,
+) -> int:
+    """在已持有的写事务内按“现有封存规则”创建一份封存资料并追加 seal 审计。
+
+    直接封存与预存存在三人确认齐后均调用本函数，两者生成的资料与审计
+    完全一致：documents / document_witnesses 行相同，seal 审计的 actor 为
+    封存人、detail 文案与直接封存一致（不含预封存流程信息）。返回资料编号。
+    调用方须保证三名见证人互异、均已注册且不含封存人本人。
+    """
+    digest = sha256_hex(body)
+    cur = tx.execute(
+        "INSERT INTO documents (owner_id, body, digest, status, created_at)"
+        " VALUES (?, ?, ?, 'sealed', ?)",
+        (owner_id, body, digest, now),
+    )
+    doc_id = int(cur.lastrowid)
+    for position, witness_id in enumerate(witness_ids):
+        tx.execute(
+            "INSERT INTO document_witnesses (document_id, user_id, position) VALUES (?, ?, ?)",
+            (doc_id, witness_id, position),
+        )
+    add_audit(
+        tx,
+        actor_id=actor_id,
+        action="seal",
+        document_id=doc_id,
+        detail=f"封存资料，摘要 {digest[:12]}…；见证人: {', '.join(witness_names)}",
+    )
+    return doc_id
+
+
 @app.post("/documents", status_code=201)
 def seal_document(
     payload: SealIn,
@@ -810,30 +898,374 @@ def seal_document(
         if missing:
             raise err(400, f"见证人尚未注册: {', '.join(missing)}")
         id_by_name = {row["username"]: row["id"] for row in witness_rows}
+        witness_ids = [id_by_name[name] for name in payload.witnesses]
 
-        digest = sha256_hex(payload.body)
         now = utc_str(now_utc())
-        cur = tx.execute(
-            "INSERT INTO documents (owner_id, body, digest, status, created_at)"
-            " VALUES (?, ?, ?, 'sealed', ?)",
-            (user["id"], payload.body, digest, now),
-        )
-        doc_id = cur.lastrowid
-        for position, witness_name in enumerate(payload.witnesses):
-            tx.execute(
-                "INSERT INTO document_witnesses (document_id, user_id, position) VALUES (?, ?, ?)",
-                (doc_id, id_by_name[witness_name], position),
-            )
-        add_audit(
+        digest = sha256_hex(payload.body)
+        doc_id = create_sealed_document(
             tx,
+            owner_id=user["id"],
+            body=payload.body,
+            witness_ids=witness_ids,
+            witness_names=payload.witnesses,
             actor_id=user["id"],
-            action="seal",
-            document_id=doc_id,
-            detail=f"封存资料，摘要 {digest[:12]}…；见证人: {', '.join(payload.witnesses)}",
+            now=now,
         )
 
     # 注意：响应不含正文
     return {"document_id": doc_id, "status": "sealed", "digest": digest, "witnesses": payload.witnesses}
+
+
+# ---------------------------------------------------------------------------
+# 预封存提案（pre-seal proposal）
+#
+# 封存人先提交正文、三名互异且非本人的已注册见证人及带时区的未来确认截止
+# 时刻，取得提案编号与正文摘要（响应不含正文）。仅发起人本人与受邀见证人
+# 可凭编号查看提案的摘要、截止时刻、状态与确认人数；其他账号（含凭编号
+# 试探）统一 403，不区分提案是否存在。见证人凭摘要各确认一次：摘要不符、
+# 重复确认一律 409 拒绝且不计票。三人在截止前确认后，在第三票的同一写
+# 事务内调用 create_sealed_document 按现有封存规则生成一份普通封存资料
+# （seal 审计与直接封存完全一致）并返回资料编号；已完成的提案重复请求
+# 不得再生成资料。发起人可在完成前撤回；截止时未集齐三人即失效；撤回、
+# 失效或完成后立即清空提案正文。确认/撤回/到期与密钥轮换按写锁已提交
+# 顺序产生唯一结果；后台扫描器、每个提案写事务与提案查询都做确定性到期
+# 判定，停机期间到期在重启恢复扫描时补结算。
+# ---------------------------------------------------------------------------
+
+
+def serialize_proposal(tx: sqlite3.Connection, prop: sqlite3.Row) -> dict[str, Any]:
+    """组装提案视图：摘要、截止时刻、状态与确认人数；绝不含提案正文。"""
+    witnesses = [
+        row["username"]
+        for row in tx.execute(
+            """SELECT u.username FROM pre_seal_witnesses w
+               JOIN users u ON u.id = w.user_id
+               WHERE w.proposal_id = ? ORDER BY w.position""",
+            (prop["id"],),
+        ).fetchall()
+    ]
+    confirmation_count = tx.execute(
+        "SELECT COUNT(*) AS c FROM pre_seal_confirmations WHERE proposal_id = ?",
+        (prop["id"],),
+    ).fetchone()["c"]
+    return {
+        "proposal_id": prop["id"],
+        "status": prop["status"],
+        "digest": prop["digest"],
+        "confirm_deadline": prop["deadline"],
+        "witnesses": witnesses,
+        "confirmation_count": confirmation_count,
+        "required": 3,
+        "document_id": prop["document_id"],
+        "created_at": prop["created_at"],
+        "resolved_at": prop["resolved_at"],
+    }
+
+
+def load_proposal_for_party(
+    db: sqlite3.Connection, proposal_id: int, user: AuthUser
+) -> sqlite3.Row:
+    """取提案并校验“发起人本人或受邀见证人”身份；其他情况统一 403，不区分存在性。
+
+    提案终结（撤回/失效/完成）后正文已清空，仍允许原参与方查看元数据
+    （摘要、截止时刻、状态、确认人数），但任何路径都不返回正文。
+    """
+    prop = db.execute(
+        "SELECT * FROM pre_seal_proposals WHERE id = ?", (proposal_id,)
+    ).fetchone()
+    if prop is None:
+        raise err(403, "无权访问该预封存提案或提案不存在")
+    if prop["owner_id"] == user["id"]:
+        return prop
+    is_witness = db.execute(
+        "SELECT 1 FROM pre_seal_witnesses WHERE proposal_id = ? AND user_id = ?",
+        (proposal_id, user["id"]),
+    ).fetchone()
+    if is_witness is None:
+        raise err(403, "无权访问该预封存提案或提案不存在")
+    return prop
+
+
+def settle_due_pre_seal_for_read(
+    db: sqlite3.Connection,
+    proposal_id: int | None = None,
+    user: AuthUser | None = None,
+) -> None:
+    """读路径的确定性预封存到期：仅当存在到点未失效的 pending 提案时才进入写事务。
+
+    与到期清除读路径同理：提案查询时若已过截止时刻仍 pending，先在写事务内
+    确定性置 expired 并清空正文，再返回最新状态，到期结论不依赖扫描器。
+    已认证账号的到期写入同样要在写锁内复核密钥：密钥已被轮换提交的请求不得
+    借读路径产生任何写入。
+    """
+    now = utc_str(now_utc())
+    if proposal_id is not None:
+        due = db.execute(
+            "SELECT 1 FROM pre_seal_proposals"
+            " WHERE id = ? AND status = 'pending' AND deadline <= ?",
+            (proposal_id, now),
+        ).fetchone()
+    else:
+        due = db.execute(
+            "SELECT 1 FROM pre_seal_proposals"
+            " WHERE status = 'pending' AND deadline <= ? LIMIT 1",
+            (now,),
+        ).fetchone()
+    if due is None:
+        return
+    with write_tx(db) as tx:
+        if user is not None and not key_still_valid(tx, user):
+            raise err(401, "凭据无效")
+        expire_due_pre_seal_proposals(tx, utc_str(now_utc()), proposal_id)
+
+
+@app.post("/pre-seal-proposals", status_code=201)
+def create_pre_seal_proposal(
+    payload: PreSealIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """封存人发起需见证人确认的预封存提案。
+
+    三名见证人须互异、均已注册且不含封存人本人；确认截止时刻带时区且晚于
+    当前。响应只给提案编号与正文摘要，绝不回显正文。
+    """
+    if len(set(payload.witnesses)) != 3:
+        raise err(400, "必须指定三名互不相同的见证人")
+    if user["username"] in payload.witnesses:
+        raise err(400, "封存人不能同时担任见证人")
+
+    deadline = utc_str(payload.confirm_deadline)
+    now = utc_str(now_utc())
+    if deadline <= now:
+        raise err(400, "确认截止时刻必须晚于当前时间")
+
+    with authed_write_tx(db, user) as tx:
+        placeholders = ",".join("?" for _ in payload.witnesses)
+        witness_rows = tx.execute(
+            f"SELECT id, username FROM users WHERE username IN ({placeholders})",
+            payload.witnesses,
+        ).fetchall()
+        found = {row["username"] for row in witness_rows}
+        missing = [w for w in payload.witnesses if w not in found]
+        if missing:
+            raise err(400, f"见证人尚未注册: {', '.join(missing)}")
+        id_by_name = {row["username"]: row["id"] for row in witness_rows}
+        witness_ids = [id_by_name[name] for name in payload.witnesses]
+
+        digest = sha256_hex(payload.body)
+        cur = tx.execute(
+            "INSERT INTO pre_seal_proposals"
+            " (owner_id, body, digest, status, deadline, created_at)"
+            " VALUES (?, ?, ?, 'pending', ?, ?)",
+            (user["id"], payload.body, digest, deadline, now),
+        )
+        proposal_id = cur.lastrowid
+        for position, witness_id in enumerate(witness_ids):
+            tx.execute(
+                "INSERT INTO pre_seal_witnesses (proposal_id, user_id, position)"
+                " VALUES (?, ?, ?)",
+                (proposal_id, witness_id, position),
+            )
+        prop = tx.execute(
+            "SELECT * FROM pre_seal_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone()
+        result = serialize_proposal(tx, prop)
+
+    # 响应不含正文
+    return result
+
+
+@app.get("/pre-seal-proposals/{proposal_id}")
+def get_pre_seal_proposal(
+    proposal_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """查看提案：仅发起人本人或受邀见证人可见（统一 403，不区分是否存在）。
+
+    只返回摘要、截止时刻、状态、确认人数与（完成后的）资料编号，绝不返回正文。
+    已过截止时刻仍 pending 的提案先被确定性置为 expired 并清空正文。
+    """
+    # 先做一次存在性/参与方校验，避免非参与方的请求借读路径触发到期写入，
+    # 也避免凭编号试探者让任意提案进入写事务（到期写只由参与方/扫描器推进）。
+    load_proposal_for_party(db, proposal_id, user)
+    settle_due_pre_seal_for_read(db, proposal_id, user)
+    prop = load_proposal_for_party(db, proposal_id, user)
+    return serialize_proposal(db, prop)
+
+
+@app.post("/pre-seal-proposals/{proposal_id}/confirmations")
+def confirm_pre_seal_proposal(
+    proposal_id: int,
+    payload: PreSealConfirmIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """受邀见证人凭提案摘要确认一次预封存。
+
+    摘要不符、重复确认一律 409 拒绝且不计票；截止时刻到达后不能确认
+    （提案确定性失效、正文清空）。第三名不同见证人确认后，在本事务内按
+    现有封存规则生成一份普通封存资料并返回资料编号；已完成提案的任何重复
+    请求（含重复确认）都不得再生成资料。
+    """
+    # 锁外预校验：非受邀见证人/不存在统一 403，不区分提案是否存在。
+    prop = db.execute(
+        "SELECT * FROM pre_seal_proposals WHERE id = ?", (proposal_id,)
+    ).fetchone()
+    if prop is None:
+        raise err(403, "无权访问该预封存提案或提案不存在")
+    is_witness = db.execute(
+        "SELECT 1 FROM pre_seal_witnesses WHERE proposal_id = ? AND user_id = ?",
+        (proposal_id, user["id"]),
+    ).fetchone()
+    if is_witness is None:
+        raise err(403, "只有受邀见证人可以确认预封存提案")
+
+    now = utc_str(now_utc())
+    # 到期若在本临界区内生效，失效先落库（清空正文），拒绝在提交后再返回，
+    # 不能让回滚撤销已生效的到期判定（与同意/撤销开封请求同一语义）。
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    try:
+        with authed_write_tx(db, user) as tx:
+            expired_here = expire_due_pre_seal_proposals(tx, now, proposal_id) > 0
+
+            prop = tx.execute(
+                "SELECT * FROM pre_seal_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+            # 进入写临界区后以“当前名单”复核（提案名单不可变，此处仍锁内再查一次）
+            if not tx.execute(
+                "SELECT 1 FROM pre_seal_witnesses WHERE proposal_id = ? AND user_id = ?",
+                (proposal_id, user["id"]),
+            ).fetchone():
+                raise err(403, "只有受邀见证人可以确认预封存提案")
+
+            if prop["status"] == "confirmed":
+                raise err(409, "预封存提案已完成，封存资料已生成，不能重复确认")
+            if prop["status"] == "revoked":
+                raise err(409, "预封存提案已被发起人撤回，不能确认")
+            if prop["status"] == "expired" or expired_here:
+                # 到期（含本临界区刚触发）必须先提交，故延迟到提交后再报错
+                post_commit_error = err(409, "预封存提案已过确认截止时刻，确认被拒绝")
+            elif payload.digest != prop["digest"]:
+                # 摘要不符：拒绝且不计票
+                raise err(409, "提交的摘要与预封存提案摘要不一致，拒绝确认")
+            elif tx.execute(
+                "SELECT 1 FROM pre_seal_confirmations WHERE proposal_id = ? AND witness_id = ?",
+                (proposal_id, user["id"]),
+            ).fetchone() is not None:
+                # 同一见证人重复确认：拒绝且不重复计票
+                raise err(409, "你已确认本预封存提案，重复提交只计一次")
+            else:
+                tx.execute(
+                    "INSERT INTO pre_seal_confirmations"
+                    " (proposal_id, witness_id, bound_digest, created_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (proposal_id, user["id"], prop["digest"], now),
+                )
+                count = tx.execute(
+                    "SELECT COUNT(*) AS c FROM pre_seal_confirmations WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchone()["c"]
+
+                new_status = "pending"
+                document_id: int | None = None
+                if count >= 3:
+                    # 三名互异见证人（UNIQUE(proposal_id, witness_id) 保证）在
+                    # 截止前确认齐：同一事务内按现有封存规则生成资料。
+                    witness_rows = tx.execute(
+                        """SELECT u.id, u.username FROM pre_seal_witnesses w
+                           JOIN users u ON u.id = w.user_id
+                           WHERE w.proposal_id = ? ORDER BY w.position""",
+                        (proposal_id,),
+                    ).fetchall()
+                    # 见证人名单按提案提交时的顺序落到资料上
+                    witness_ids = [row["id"] for row in witness_rows]
+                    witness_names = [row["username"] for row in witness_rows]
+                    document_id = create_sealed_document(
+                        tx,
+                        owner_id=prop["owner_id"],
+                        body=prop["body"],
+                        witness_ids=witness_ids,
+                        witness_names=witness_names,
+                        actor_id=prop["owner_id"],
+                        now=now,
+                    )
+                    tx.execute(
+                        "UPDATE pre_seal_proposals"
+                        " SET status='confirmed', body='', document_id=?, resolved_at=?"
+                        " WHERE id=? AND status='pending'",
+                        (document_id, now, proposal_id),
+                    )
+                    new_status = "confirmed"
+
+                prop = tx.execute(
+                    "SELECT * FROM pre_seal_proposals WHERE id = ?", (proposal_id,)
+                ).fetchone()
+                result = {
+                    **serialize_proposal(tx, prop),
+                    "new_status": new_status,
+                }
+                if document_id is not None:
+                    result["document_id"] = document_id
+        if post_commit_error is not None:
+            raise post_commit_error
+        assert result is not None
+        return result
+    except sqlite3.IntegrityError:
+        # UNIQUE(proposal_id, witness_id) 兜底（并发重复确认）：只计一次
+        raise err(409, "你已确认本预封存提案，重复提交只计一次")
+
+
+@app.post("/pre-seal-proposals/{proposal_id}/revoke")
+def revoke_pre_seal_proposal(
+    proposal_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """发起人在完成（或到期）前撤回预封存提案；撤回后正文立即清空。
+
+    非发起人/不存在统一 403；已完成、已撤回、已失效的提案不能撤回（409）。
+    到期若在本临界区内生效，失效先提交（清空正文），撤回失败在提交后返回。
+    """
+    prop = db.execute(
+        "SELECT * FROM pre_seal_proposals WHERE id = ?", (proposal_id,)
+    ).fetchone()
+    if prop is None or prop["owner_id"] != user["id"]:
+        raise err(403, "无权操作该预封存提案或提案不存在")
+
+    now = utc_str(now_utc())
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with authed_write_tx(db, user) as tx:
+        expired_here = expire_due_pre_seal_proposals(tx, now, proposal_id) > 0
+
+        prop = tx.execute(
+            "SELECT * FROM pre_seal_proposals WHERE id = ?", (proposal_id,)
+        ).fetchone()
+        if prop["owner_id"] != user["id"]:
+            raise err(403, "只有预封存发起人可以撤回该提案")
+        if prop["status"] == "confirmed":
+            raise err(409, "预封存提案已完成，封存资料已生成，不能撤回")
+        if prop["status"] == "revoked":
+            raise err(409, "预封存提案已撤回")
+        if prop["status"] == "expired" or expired_here:
+            post_commit_error = err(409, "预封存提案已过确认截止时刻，不能撤回")
+        else:
+            tx.execute(
+                "UPDATE pre_seal_proposals SET status='revoked', body='', resolved_at=?"
+                " WHERE id=? AND status='pending'",
+                (now, proposal_id),
+            )
+            prop = tx.execute(
+                "SELECT * FROM pre_seal_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+            result = serialize_proposal(tx, prop)
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
 
 
 def load_doc_for_participant(
